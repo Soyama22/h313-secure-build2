@@ -1,0 +1,87 @@
+name: Build Secure H313 X96Q LPDDR3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          sudo apt-get clean
+          df -h
+
+      - name: Clone NickAlilovic Armbian build
+        run: |
+          git clone --depth 1 --branch v20251014 https://github.com/NickAlilovic/build.git build
+          cd build
+          git status --short
+
+      - name: Enable X96Q LPDDR3 TOC0 secure boot
+        shell: bash
+        run: |
+          cd build
+
+          DEF="$(find . -type f \( -iname '*x96q*lpddr3*defconfig*.patch' -o -iname '*x96q*lpddr3*.patch' \) | head -n 1)"
+          echo "Defconfig patch: $DEF"
+          test -n "$DEF"
+
+          python3 - "$DEF" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          line = "+CONFIG_SPL_IMAGE_TYPE_SUNXI_TOC0=y\n"
+          if line not in s:
+              for anchor in ("+CONFIG_SPL_I2C_SUPPORT=y\n", "+CONFIG_SPL=y\n"):
+                  if anchor in s:
+                      s = s.replace(anchor, anchor + line, 1)
+                      break
+              else:
+                  raise SystemExit("Could not find insertion point in X96Q LPDDR3 defconfig patch")
+              p.write_text(s)
+          print("TOC0 option present:", line.strip() in p.read_text())
+          PY
+
+          SECURE="$(find . -type f -name 'secure-boot.patch' | head -n 1)"
+          echo "Secure boot patch: $SECURE"
+          test -n "$SECURE"
+
+          grep -n 'CONFIG_SPL_IMAGE_TYPE_SUNXI_TOC0' "$DEF"
+          grep -n 'root_key.pem' "$SECURE" | head || true
+
+      - name: Build minimal Bookworm image
+        run: |
+          cd build
+          ./compile.sh \
+            BOARD=x96q-lpddr3 \
+            BRANCH=current \
+            RELEASE=bookworm \
+            BUILD_MINIMAL=yes \
+            BUILD_DESKTOP=no \
+            KERNEL_ONLY=no \
+            KERNEL_CONFIGURE=no \
+            EXPERT=yes \
+            SHARE_LOG=no
+
+      - name: Show output
+        if: always()
+        run: |
+          find build/output -maxdepth 3 -type f -printf '%p %k KB\n' 2>/dev/null | sort || true
+          df -h
+
+      - name: Upload Armbian image
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: armbian-h313-x96q-lpddr3-secure
+          path: |
+            build/output/images/*
+          if-no-files-found: error
+          compression-level: 0
