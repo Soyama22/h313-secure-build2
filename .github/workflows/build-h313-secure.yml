@@ -18,56 +18,141 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Clone NickAlilovic Armbian build
+      - name: Clone sicXnull X96Q LPDDR3 build
         run: |
-          git clone --depth 1 --branch v20251014 https://github.com/NickAlilovic/build.git build
+          git clone --depth 1 \
+            --branch X96Q-TVBOX-LPDDR3 \
+            --single-branch \
+            https://github.com/sicXnull/armbian-build.git build
           cd build
           git status --short
 
-      - name: Enable X96Q LPDDR3 TOC0 secure boot
+      - name: Add TOC0 secure boot to X96Q LPDDR3 U-Boot patch
         shell: bash
         run: |
+          set -euo pipefail
           cd build
 
-          DEF="$(find . -type f \( -iname '*x96q*lpddr3*defconfig*.patch' -o -iname '*x96q*lpddr3*.patch' \) | head -n 1)"
-          echo "Defconfig patch: $DEF"
+          # Find the U-Boot patch that actually creates configs/x96q_lpddr3_defconfig.
+          # This intentionally ignores similarly named KERNEL DTS patches.
+          DEF="$(grep -RIl --include='*.patch' \
+            'configs/x96q_lpddr3_defconfig' patch/u-boot 2>/dev/null | head -n 1)"
+
+          echo "U-Boot defconfig patch: $DEF"
           test -n "$DEF"
 
           python3 - "$DEF" <<'PY'
-          import pathlib, sys
+          import pathlib, re, sys
+
           p = pathlib.Path(sys.argv[1])
-          s = p.read_text()
-          line = "+CONFIG_SPL_IMAGE_TYPE_SUNXI_TOC0=y\n"
-          if line not in s:
-              for anchor in ("+CONFIG_SPL_I2C_SUPPORT=y\n", "+CONFIG_SPL=y\n"):
-                  if anchor in s:
-                      s = s.replace(anchor, anchor + line, 1)
+          lines = p.read_text().splitlines(keepends=True)
+
+          # Find the x96q_lpddr3_defconfig diff section.
+          start = None
+          for i, line in enumerate(lines):
+              if line.startswith("+++ ") and line.rstrip().endswith("configs/x96q_lpddr3_defconfig"):
+                  start = i
+                  break
+          if start is None:
+              raise SystemExit("configs/x96q_lpddr3_defconfig section not found")
+
+          # Limit search to this diff section.
+          end = len(lines)
+          for i in range(start + 1, len(lines)):
+              if lines[i].startswith("diff --git "):
+                  end = i
+                  break
+
+          # Already patched?
+          wanted = "+CONFIG_SPL_IMAGE_TYPE_SUNXI_TOC0=y\n"
+          if any(line == wanted for line in lines[start:end]):
+              print("TOC0 option already present")
+              raise SystemExit(0)
+
+          # Find the hunk header for the newly created defconfig.
+          hunk = None
+          hunk_re = re.compile(r"^@@ -0,0 \+1,(\d+) @@")
+          for i in range(start + 1, end):
+              if hunk_re.match(lines[i]):
+                  hunk = i
+                  break
+          if hunk is None:
+              raise SystemExit("defconfig hunk header not found")
+
+          # Insert after a known line inside the defconfig.
+          insert_at = None
+          for anchor in (
+              "+CONFIG_SPL_I2C_SUPPORT=y\n",
+              "+CONFIG_SPL=y\n",
+          ):
+              for i in range(hunk + 1, end):
+                  if lines[i] == anchor:
+                      insert_at = i + 1
                       break
-              else:
-                  raise SystemExit("Could not find insertion point in X96Q LPDDR3 defconfig patch")
-              p.write_text(s)
-          print("TOC0 option present:", line.strip() in p.read_text())
+              if insert_at is not None:
+                  break
+
+          if insert_at is None:
+              raise SystemExit("Could not find insertion point in x96q_lpddr3_defconfig")
+
+          # Increment the '+1,N' count in the patch hunk by one.
+          m = hunk_re.match(lines[hunk])
+          old_count = int(m.group(1))
+          lines[hunk] = re.sub(
+              r"^@@ -0,0 \+1,\d+ @@",
+              f"@@ -0,0 +1,{old_count + 1} @@",
+              lines[hunk],
+              count=1,
+          )
+
+          lines.insert(insert_at, wanted)
+          p.write_text("".join(lines))
+          print(f"Added TOC0 option and changed defconfig hunk count {old_count} -> {old_count + 1}")
           PY
 
-          SECURE="$(find . -type f -name 'secure-boot.patch' | head -n 1)"
-          echo "Secure boot patch: $SECURE"
-          test -n "$SECURE"
+          grep -n -A3 -B3 'CONFIG_SPL_IMAGE_TYPE_SUNXI_TOC0' "$DEF"
 
-          grep -n 'CONFIG_SPL_IMAGE_TYPE_SUNXI_TOC0' "$DEF"
-          grep -n 'root_key.pem' "$SECURE" | head || true
+      - name: Add RSA root key as the last U-Boot patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd build
+
+          DEF="$(grep -RIl --include='*.patch' \
+            'configs/x96q_lpddr3_defconfig' patch/u-boot 2>/dev/null | head -n 1)"
+          PATCH_DIR="$(dirname "$DEF")"
+
+          echo "U-Boot patch directory: $PATCH_DIR"
+
+          rm -rf /tmp/h313-keypatch
+          mkdir -p /tmp/h313-keypatch
+          cd /tmp/h313-keypatch
+
+          openssl genrsa -out root_key.pem 2048
+          test -s root_key.pem
+
+          # Armbian applies U-Boot patches by filename order here.
+          # Prefix with zz- so the root key is added after the board/defconfig patch.
+          git diff --no-index -- /dev/null root_key.pem \
+            > "$GITHUB_WORKSPACE/build/$PATCH_DIR/zz-h313-secure-root-key.patch" || rc=$?
+          test "${rc:-1}" -eq 1
+
+          echo "Created secure-key patch:"
+          ls -lh "$GITHUB_WORKSPACE/build/$PATCH_DIR/zz-h313-secure-root-key.patch"
+          head -n 12 "$GITHUB_WORKSPACE/build/$PATCH_DIR/zz-h313-secure-root-key.patch"
 
       - name: Build minimal Bookworm image
         run: |
           cd build
-          ./compile.sh \
-            BOARD=x96q-lpddr3 \
+          ./compile.sh build \
+            BOARD=x96q-v1-3 \
             BRANCH=current \
             RELEASE=bookworm \
             BUILD_MINIMAL=yes \
             BUILD_DESKTOP=no \
-            KERNEL_ONLY=no \
-            KERNEL_CONFIGURE=no \
             EXPERT=yes \
+            KERNEL_CONFIGURE=no \
+            KERNEL_GIT=shallow \
             SHARE_LOG=no
 
       - name: Show output
@@ -80,7 +165,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: armbian-h313-x96q-lpddr3-secure
+          name: armbian-h313-x96q-v1-3-secure
           path: |
             build/output/images/*
           if-no-files-found: error
