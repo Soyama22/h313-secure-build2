@@ -147,7 +147,7 @@ jobs:
           ./compile.sh build \
             BOARD=x96q-v1-3 \
             BRANCH=current \
-            RELEASE=bookworm \
+            RELEASE=noble \
             BUILD_MINIMAL=yes \
             BUILD_DESKTOP=no \
             EXPERT=yes \
